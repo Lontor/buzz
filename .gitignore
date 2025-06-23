@@ -1,0 +1,17 @@
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+/build/
+/bin/
+/dist/
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
