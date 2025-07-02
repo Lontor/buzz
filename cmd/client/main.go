@@ -2,13 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"unsafe"
 
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	"github.com/gen2brain/malgo"
 	"github.com/hraban/opus"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 )
 
 func newAudioHandler(inCh, outCh chan []byte) func([]byte, []byte, uint32) {
@@ -74,13 +80,13 @@ func main() {
 	channelsNum := 1
 	sampleRate := 48000
 
-	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {})
+	malgoCtx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {})
 	if err != nil {
 		log.Fatalln(err)
 	}
 	defer func() {
-		ctx.Uninit()
-		ctx.Free()
+		malgoCtx.Uninit()
+		malgoCtx.Free()
 	}()
 
 	deviceConfig := malgo.DefaultDeviceConfig(malgo.Duplex)
@@ -94,7 +100,7 @@ func main() {
 	playbackCh := make(chan []byte, 16)
 	mikeCh := make(chan []byte, 16)
 
-	device, err := malgo.InitDevice(ctx.Context, deviceConfig, malgo.DeviceCallbacks{Data: newAudioHandler(playbackCh, mikeCh)})
+	device, err := malgo.InitDevice(malgoCtx.Context, deviceConfig, malgo.DeviceCallbacks{Data: newAudioHandler(playbackCh, mikeCh)})
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -106,9 +112,127 @@ func main() {
 	go bytesToOpus(encoder, mikeCh, encodedCh)
 
 	decoder, _ := opus.NewDecoder(sampleRate, channelsNum)
-	go opusToBytes(decoder, encodedCh, playbackCh)
+	decodedCh := make(chan []byte, 16)
+	go opusToBytes(decoder, decodedCh, playbackCh)
 
 	err = device.Start()
+
+	config := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs:       []string{"stun:stun.l.google.com:19302"},
+				Username:   "user",
+				Credential: "pass",
+			},
+		},
+	}
+
+	peerConnection, err := webrtc.NewPeerConnection(config)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "audio")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	_, err = peerConnection.AddTrack(track)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	go func() {
+		seq := uint16(0)
+		ssrc := uint32(12345)
+		timestamp := uint32(0)
+		for {
+			audioData := <-encodedCh
+
+			packet := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					PayloadType:    111,
+					SequenceNumber: seq,
+					Timestamp:      timestamp,
+					SSRC:           ssrc,
+				},
+				Payload: audioData,
+			}
+
+			seq++
+			timestamp += 960
+
+			err := track.WriteRTP(packet)
+			if err != nil {
+				log.Println("Error writing RTP packet:", err)
+			}
+		}
+	}()
+
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		go func() {
+			for {
+				packet, _, err := track.ReadRTP()
+				if err != nil {
+					log.Println("Error reading RTP packet:", err)
+					return
+				}
+				decodedAudio := make([]byte, len(packet.Payload))
+				copy(decodedAudio, packet.Payload)
+				decodedCh <- decodedAudio
+			}
+		}()
+	})
+
+	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		fmt.Println("ICE state:", state)
+	})
+
+	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		fmt.Println("PeerConnection state:", state)
+	})
+
+	ctx := context.Background()
+	ws, _, err := websocket.Dial(ctx, "ws://0.0.0.0:8080/signaling", nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	roomID := 123
+	wsjson.Write(ctx, ws, roomID)
+
+	var role string
+	wsjson.Read(ctx, ws, &role)
+
+	if role == "offer" {
+		offer, err := peerConnection.CreateOffer(nil)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		peerConnection.SetLocalDescription(offer)
+
+		<-webrtc.GatheringCompletePromise(peerConnection)
+
+		wsjson.Write(ctx, ws, peerConnection.LocalDescription())
+		var answer webrtc.SessionDescription
+		wsjson.Read(ctx, ws, &answer)
+		peerConnection.SetRemoteDescription(answer)
+	} else {
+		var offer webrtc.SessionDescription
+		wsjson.Read(ctx, ws, &offer)
+		peerConnection.SetRemoteDescription(offer)
+
+		answer, err := peerConnection.CreateAnswer(nil)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		peerConnection.SetLocalDescription(answer)
+
+		<-webrtc.GatheringCompletePromise(peerConnection)
+
+		wsjson.Write(ctx, ws, peerConnection.LocalDescription())
+	}
 
 	select {}
 }
