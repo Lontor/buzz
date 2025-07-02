@@ -12,9 +12,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/gen2brain/malgo"
-	"github.com/hraban/opus"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	"gopkg.in/hraban/opus.v2"
 )
 
 func newAudioHandler(inCh, outCh chan []byte) func([]byte, []byte, uint32) {
