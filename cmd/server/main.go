@@ -2,18 +2,16 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/pion/turn/v4"
 )
-
-var cache sync.Map
 
 func serveTURN() {
 	log.Println("Starting TURN server...")
@@ -55,33 +53,81 @@ func serveTURN() {
 	server.AllocationCount()
 }
 
+type Room struct {
+	Mu   sync.Mutex
+	Num  int
+	Conn [2]*websocket.Conn
+}
+
+func (r *Room) relayMessages(ctx context.Context) {
+	errCh := make(chan error)
+	relay := func(src, dst *websocket.Conn) {
+		for {
+			msgType, data, err := src.Read(ctx)
+			if err != nil {
+				errCh <- err
+			}
+
+			if err := dst.Write(ctx, msgType, data); err != nil {
+				errCh <- err
+			}
+		}
+	}
+
+	go relay(r.Conn[0], r.Conn[1])
+	go relay(r.Conn[1], r.Conn[0])
+
+	select {
+	case <-ctx.Done():
+	case <-errCh:
+	}
+}
+
 func main() {
 	go serveTURN()
 
+	cache := make(map[int]*Room, 100)
+	var mu sync.Mutex
+
 	go func() {
 		http.HandleFunc("/signaling", func(w http.ResponseWriter, r *http.Request) {
-			conn, err := websocket.Accept(w, r, nil)
+			peer, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
 			}
+
 			ctx := context.Background()
 			var roomNum int
-			wsjson.Read(ctx, conn, &roomNum)
-			if cl, ok := cache.LoadOrStore(roomNum, conn); ok {
-				fmt.Println("Start")
-				cli := (cl).(*websocket.Conn)
-				wsjson.Write(ctx, cli, "offer")
-				wsjson.Write(ctx, conn, "answer")
-				t, data, _ := cli.Read(ctx)
-				conn.Write(ctx, t, data)
-				fmt.Println("offer send")
-				t, data, _ = conn.Read(ctx)
-				cli.Write(ctx, t, data)
-				fmt.Println("answer send")
-				cli.CloseNow()
-				conn.CloseNow()
-				cache.Delete(roomNum)
+			wsjson.Read(ctx, peer, &roomNum)
+
+			mu.Lock()
+			room, ok := cache[roomNum]
+
+			if !ok {
+				cache[roomNum] = &Room{Conn: [2]*websocket.Conn{peer, nil}, Num: 1}
+				mu.Unlock()
+				return
 			}
+			mu.Unlock()
+
+			room.Mu.Lock()
+			if room.Num > 1 {
+				peer.Close(websocket.StatusTryAgainLater, "full room")
+				room.Mu.Unlock()
+				return
+			}
+			room.Num++
+			room.Conn[1] = peer
+			room.Mu.Unlock()
+
+			defer func() {
+				mu.Lock()
+				delete(cache, roomNum)
+				mu.Unlock()
+			}()
+			ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+			room.relayMessages(ctx)
+			cancel()
 		})
 
 		err := http.ListenAndServe(":8080", nil)
