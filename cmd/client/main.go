@@ -1,238 +1,199 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"fmt"
-	"io"
 	"log"
-	"unsafe"
+	"time"
+
+	"buzz/internal/audio"
+	"buzz/internal/codec"
+	"buzz/internal/transport/rtc"
+	"buzz/internal/transport/ws"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-	"github.com/gen2brain/malgo"
-	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
-	"gopkg.in/hraban/opus.v2"
+	"golang.org/x/sync/errgroup"
 )
 
-func newAudioHandler(inCh, outCh chan []byte) func([]byte, []byte, uint32) {
-	buf := bytes.NewBuffer(make([]byte, 1024))
-	var tmp []byte
-	return func(out, in []byte, framecount uint32) {
-	loop:
-		for buf.Len() < int(framecount)*2 {
-			select {
-			case tmp = <-inCh:
-				buf.Write(tmp)
-			default:
-				break loop
-			}
-		}
-
-		if buf.Len() >= int(framecount)*2 {
-			io.ReadFull(buf, out)
-		}
-
-		tmp := make([]byte, len(in))
-		copy(tmp, in)
-		select {
-		case outCh <- tmp:
-		default:
-
-		}
-	}
-}
-
-func bytesToOpus(encoder *opus.Encoder, inCh, outCh chan []byte) {
-	const frameSize = 960
-	const channels = 1
-
-	buf := bytes.NewBuffer(nil)
-
-	for in := range inCh {
-		buf.Write(in)
-
-		for buf.Len() >= frameSize*2 {
-			frame := make([]int16, frameSize)
-			binary.Read(buf, binary.LittleEndian, frame)
-
-			encoded := make([]byte, 400)
-			n, _ := encoder.Encode(frame, encoded)
-			outCh <- encoded[:n]
-		}
-	}
-}
-
-func opusToBytes(decoder *opus.Decoder, inCh, outCh chan []byte) {
-	const frameSize = 960
-
-	for in := range inCh {
-		pcm := make([]int16, frameSize)
-		n, _ := decoder.Decode(in, pcm)
-		outCh <- unsafe.Slice((*byte)(unsafe.Pointer(&pcm[0])), n*2)
-	}
-}
-
 func main() {
-	audioFormat := malgo.FormatS16
-	channelsNum := 1
-	sampleRate := 48000
+	const audioFormat = audio.FormatF32
+	const channelsNum = 2
+	const sampleRate = 48000
 
-	malgoCtx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log.Println("Connecting to WebSocket server...")
+	conn, _, err := websocket.Dial(ctx, "ws://192.168.1.60:8080/signaling", nil)
 	if err != nil {
-		log.Fatalln(err)
-	}
-	defer func() {
-		malgoCtx.Uninit()
-		malgoCtx.Free()
-	}()
-
-	deviceConfig := malgo.DefaultDeviceConfig(malgo.Duplex)
-	deviceConfig.Capture.Format = audioFormat
-	deviceConfig.Capture.Channels = uint32(channelsNum)
-	deviceConfig.Playback.Format = audioFormat
-	deviceConfig.Playback.Channels = uint32(channelsNum)
-	deviceConfig.SampleRate = uint32(sampleRate)
-	deviceConfig.Alsa.NoMMap = 1
-
-	playbackCh := make(chan []byte, 16)
-	mikeCh := make(chan []byte, 16)
-
-	device, err := malgo.InitDevice(malgoCtx.Context, deviceConfig, malgo.DeviceCallbacks{Data: newAudioHandler(playbackCh, mikeCh)})
-	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Error dialing WebSocket: %v", err)
 	}
 
-	encodedCh := make(chan []byte, 16)
-	encoder, _ := opus.NewEncoder(sampleRate, channelsNum, opus.AppAudio)
-	encoder.SetBitrateToMax()
-	encoder.SetComplexity(10)
-	go bytesToOpus(encoder, mikeCh, encodedCh)
-
-	decoder, _ := opus.NewDecoder(sampleRate, channelsNum)
-	decodedCh := make(chan []byte, 16)
-	go opusToBytes(decoder, decodedCh, playbackCh)
-
-	err = device.Start()
-
+	log.Println("Setting up PeerConnection...")
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs:       []string{"stun:stun.l.google.com:19302"},
-				Username:   "user",
-				Credential: "pass",
+				URLs: []string{"stun:stun.l.google.com:19302"},
 			},
 		},
 	}
 
-	peerConnection, err := webrtc.NewPeerConnection(config)
+	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Error creating PeerConnection: %v", err)
 	}
 
-	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "audio")
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("ICE connection state changed: %s", state)
+	})
+
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("PeerConnection state changed: %s", state)
+	})
+
+	pc.OnSignalingStateChange(func(ss webrtc.SignalingState) {
+		log.Printf("Signaling state changed: %s", ss)
+	})
+
+	log.Println("Sending WebSocket message...")
+	err = wsjson.Write(ctx, conn, 256)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Error sending WebSocket message: %v", err)
 	}
 
-	_, err = peerConnection.AddTrack(track)
+	log.Println("Dialing RTC...")
+	peer, err := rtc.Dial(ctx, pc, ws.NewConn(conn))
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Error dialing RTC: %v", err)
 	}
 
-	go func() {
-		seq := uint16(0)
-		ssrc := uint32(12345)
-		timestamp := uint32(0)
-		for {
-			audioData := <-encodedCh
+	log.Println("Creating audio track for sending...")
+	send, err := peer.NewTrack(ctx, rtc.TrackInfo{
+		Kind:           "audio",
+		MimeType:       webrtc.MimeTypeOpus,
+		ClockRate:      48000,
+		Channels:       2,
+		StreamID:       "stream",
+		TrackName:      "stream",
+		SampleDuration: 20 * time.Millisecond,
+		BitDepth:       32,
+	})
+	if err != nil {
+		log.Fatalf("Error creating send track: %v", err)
+	}
 
-			packet := &rtp.Packet{
-				Header: rtp.Header{
-					Version:        2,
-					PayloadType:    111,
-					SequenceNumber: seq,
-					Timestamp:      timestamp,
-					SSRC:           ssrc,
-				},
-				Payload: audioData,
-			}
+	log.Println("Accepting audio track for receiving...")
+	receive, err := peer.AcceptTrack(ctx)
+	if err != nil {
+		log.Fatalf("Error accepting receive track: %v", err)
+	}
 
-			seq++
-			timestamp += 960
-
-			err := track.WriteRTP(packet)
-			if err != nil {
-				log.Println("Error writing RTP packet:", err)
-			}
-		}
+	log.Println("Initializing audio engine...")
+	eng, err := audio.NewAudioEngine()
+	if err != nil {
+		log.Fatalf("Error initializing audio engine: %v", err)
+	}
+	defer func() {
+		log.Println("Closing audio engine...")
+		eng.Close()
 	}()
 
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		go func() {
-			for {
-				packet, _, err := track.ReadRTP()
-				if err != nil {
-					log.Println("Error reading RTP packet:", err)
-					return
-				}
-				decodedAudio := make([]byte, len(packet.Payload))
-				copy(decodedAudio, packet.Payload)
-				decodedCh <- decodedAudio
-			}
-		}()
-	})
-
-	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		fmt.Println("ICE state:", state)
-	})
-
-	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		fmt.Println("PeerConnection state:", state)
-	})
-
-	ctx := context.Background()
-	ws, _, err := websocket.Dial(ctx, "ws://0.0.0.0:8080/signaling", nil)
+	log.Println("Creating capture device...")
+	capt, err := eng.NewCaptureDevice(ctx, audioFormat, channelsNum, sampleRate, 20)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Error creating capture device: %v", err)
+	}
+	defer func() {
+		log.Println("Closing capture device...")
+		capt.Close()
+	}()
+
+	log.Println("Creating playback device...")
+	play, err := eng.NewPlaybackDevice(ctx, audioFormat, channelsNum, sampleRate, 20)
+	if err != nil {
+		log.Fatalf("Error creating playback device: %v", err)
+	}
+	defer func() {
+		log.Println("Closing playback device...")
+		play.Close()
+	}()
+
+	log.Println("Creating Opus decoder...")
+	dec, err := codec.NewOpusDecoder(audioFormat, channelsNum, sampleRate, 20)
+	if err != nil {
+		log.Fatalf("Error creating Opus decoder: %v", err)
 	}
 
-	roomID := 123
-	wsjson.Write(ctx, ws, roomID)
-
-	var role string
-	wsjson.Read(ctx, ws, &role)
-
-	if role == "offer" {
-		offer, err := peerConnection.CreateOffer(nil)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		peerConnection.SetLocalDescription(offer)
-
-		<-webrtc.GatheringCompletePromise(peerConnection)
-
-		wsjson.Write(ctx, ws, peerConnection.LocalDescription())
-		var answer webrtc.SessionDescription
-		wsjson.Read(ctx, ws, &answer)
-		peerConnection.SetRemoteDescription(answer)
-	} else {
-		var offer webrtc.SessionDescription
-		wsjson.Read(ctx, ws, &offer)
-		peerConnection.SetRemoteDescription(offer)
-
-		answer, err := peerConnection.CreateAnswer(nil)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		peerConnection.SetLocalDescription(answer)
-
-		<-webrtc.GatheringCompletePromise(peerConnection)
-
-		wsjson.Write(ctx, ws, peerConnection.LocalDescription())
+	log.Println("Creating Opus encoder...")
+	enc, err := codec.NewOpusEncoder(audioFormat, channelsNum, sampleRate)
+	if err != nil {
+		log.Fatalf("Error creating Opus encoder: %v", err)
 	}
 
-	select {}
+	enc.SetBitrateToMax()
+	enc.SetComplexity(10)
+	enc.SetDTX(true)
+
+	log.Println("Starting capture, encode, decode, and playback...")
+
+	group, groupCtx := errgroup.WithContext(ctx)
+
+	captureCh := make(chan []byte, 16)
+	compressCh := make(chan []byte, 16)
+	receiveCh := make(chan codec.DecodeTask, 16)
+	decompressCh := make(chan []byte, 16)
+
+	group.Go(func() error {
+		stage, err := capt.CaptureStage(groupCtx, captureCh)
+		if err != nil {
+			return err
+		}
+		return stage()
+	})
+
+	group.Go(enc.EncodeStage(groupCtx, captureCh, compressCh))
+
+	group.Go(func() error {
+		var data []byte
+		for {
+			select {
+			case <-groupCtx.Done():
+				return groupCtx.Err()
+			case data = <-compressCh:
+			}
+
+			err := send.Write(groupCtx, data)
+			if err != nil {
+				return err
+			}
+		}
+	})
+
+	group.Go(func() error {
+		stage, err := play.PlaybackStage(groupCtx, decompressCh)
+		if err != nil {
+			return err
+		}
+		return stage()
+	})
+
+	group.Go(dec.DecodeStage(groupCtx, receiveCh, decompressCh))
+
+	group.Go(func() error {
+		for {
+			pack, err := receive.ReadRTP(groupCtx)
+			if err != nil {
+				return err
+			}
+
+			select {
+			case <-groupCtx.Done():
+				return groupCtx.Err()
+			case receiveCh <- codec.DecodeTask{Data: pack.Payload, RestoreFrame: false}:
+			}
+		}
+	})
+
+	log.Fatal(group.Wait())
 }
