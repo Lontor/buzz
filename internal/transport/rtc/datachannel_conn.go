@@ -14,10 +14,12 @@ type DataChannelConn struct {
 	closeCh  chan struct{}
 	closeErr error
 	mu       sync.Mutex
+	label    string
+	protocol string
 }
 
-func NewConn(dc *webrtc.DataChannel) *DataChannelConn {
-	c := &DataChannelConn{
+func createDataChannel(dc *webrtc.DataChannel) <-chan *DataChannelConn {
+	dcConn := &DataChannelConn{
 		dc:      dc,
 		readCh:  make(chan []byte, 64),
 		closeCh: make(chan struct{}),
@@ -25,22 +27,69 @@ func NewConn(dc *webrtc.DataChannel) *DataChannelConn {
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		select {
-		case c.readCh <- msg.Data:
-		case <-c.closeCh:
-
+		case dcConn.readCh <- msg.Data:
+		case <-dcConn.closeCh:
 		}
 	})
 
 	dc.OnClose(func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.closeErr == nil {
-			c.closeErr = errors.New("datachannel closed")
-		}
-		close(c.closeCh)
+		dcConn.Close()
 	})
 
-	return c
+	ready := make(chan *DataChannelConn, 1)
+	var once sync.Once
+
+	waitOpen := func() {
+		once.Do(func() { ready <- dcConn })
+	}
+
+	dc.OnOpen(waitOpen)
+	if dc.ReadyState() == webrtc.DataChannelStateOpen {
+		waitOpen()
+	}
+
+	return ready
+}
+
+func (ps *PeerSession) NewDataChannel(ctx context.Context, label, protocol string) (*DataChannelConn, error) {
+	dc, err := ps.pc.CreateDataChannel(label, &webrtc.DataChannelInit{Protocol: &protocol})
+	if err != nil {
+		return nil, err
+	}
+
+	ready := createDataChannel(dc)
+
+	select {
+	case dcConn := <-ready:
+		dcConn.label = dc.Label()
+		dcConn.protocol = dc.Protocol()
+		return dcConn, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (ps *PeerSession) AcceptDataChannel(ctx context.Context) (*DataChannelConn, error) {
+	var dc *webrtc.DataChannel
+	for {
+		select {
+		case dc = <-ps.incomingDCCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+		ready := createDataChannel(dc)
+
+		select {
+		case dcConn := <-ready:
+			dcConn.label = dc.Label()
+			dcConn.protocol = dc.Protocol()
+			return dcConn, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+	}
 }
 
 func (c *DataChannelConn) Write(ctx context.Context, data []byte) error {
@@ -80,4 +129,12 @@ func (c *DataChannelConn) Close() error {
 		close(c.closeCh)
 	}
 	return c.dc.Close()
+}
+
+func (c *DataChannelConn) Laber() string {
+	return c.label
+}
+
+func (c *DataChannelConn) Protocol() string {
+	return c.protocol
 }

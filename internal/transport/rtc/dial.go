@@ -2,7 +2,7 @@ package rtc
 
 import (
 	"context"
-	"sync"
+	"fmt"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -19,80 +19,81 @@ type Conn interface {
 	Close() error
 }
 
-type PeerConnection struct {
+type PeerSession struct {
 	pc       *webrtc.PeerConnection
 	signaler *Signaler
-	ctx      context.Context
-	cancel   func()
+	*TrackManager
+	ctx    context.Context
+	cancel func()
+
+	incomingDCCh chan *webrtc.DataChannel
 }
 
-func Dial(ctx context.Context, pc *webrtc.PeerConnection, conn Conn) (*PeerConnection, error) {
-	ct, cancel := context.WithCancel(context.Background())
-	protocol := "signaling"
-	var err error
+func Dial(ctx context.Context, pc *webrtc.PeerConnection, conn Conn) (*PeerSession, error) {
+	ct, cancel := context.WithCancel(ctx)
 
-	peer := &PeerConnection{
-		pc:     pc,
-		ctx:    ct,
-		cancel: cancel,
-	}
-
-	var dcConn *DataChannelConn
-	waitCh := make(chan struct{})
-	var once sync.Once
-	wait := func(dc *webrtc.DataChannel) {
-		dc.OnOpen(func() {
-			once.Do(func() { close(waitCh) })
-		})
-		if dc.ReadyState() == webrtc.DataChannelStateOpen {
-			once.Do(func() { close(waitCh) })
-		}
+	peer := &PeerSession{
+		pc:           pc,
+		ctx:          ct,
+		cancel:       cancel,
+		incomingDCCh: make(chan *webrtc.DataChannel, 12),
 	}
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		dcConn = NewConn(dc)
-		wait(dc)
+		peer.incomingDCCh <- dc
 	})
 
-	signaler := SetSignaler(ctx, conn, pc)
-	priority, err := signaler.GetPriority(ctx)
+	signaler := SetSignaler(ct, conn, pc)
+	priority, err := signaler.GetPriority(ct)
 	if err != nil {
 		return nil, err
 	}
 
+	pc.OnNegotiationNeeded(func() {
+		_ = signaler.ExchangeSDP(peer.ctx)
+	})
+
+	var dcConn *DataChannelConn
 	if priority {
-		dc, err := pc.CreateDataChannel("signaling", &webrtc.DataChannelInit{Protocol: &protocol})
+		dcConn, err = peer.NewDataChannel(ct, "init", "signaler")
 		if err != nil {
 			return nil, err
 		}
-		dcConn = NewConn(dc)
-		wait(dc)
-
-		err = signaler.ExchangeSDP(ctx)
+	} else {
+		dcConn, err = peer.AcceptDataChannel(ct)
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	select {
-	case <-waitCh:
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
 
 	signaler.Close()
-
-	pc.OnDataChannel(nil)
 	peer.signaler = SetSignaler(ct, dcConn, pc)
 
 	pc.OnNegotiationNeeded(func() {
-		peer.signaler.ExchangeSDP(peer.ctx)
+		err = peer.signaler.ExchangeSDP(peer.ctx)
+		if err != nil {
+			fmt.Println(err)
+		}
 	})
+
+	var metaDC *DataChannelConn
+	if priority {
+		metaDC, err = peer.NewDataChannel(ct, "track-metadata", "metadata")
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		metaDC, err = peer.AcceptDataChannel(ct)
+		if err != nil {
+			return nil, err
+		}
+	}
+	peer.TrackManager = peer.SetTrackManager(metaDC)
 
 	return peer, nil
 }
 
-func (p *PeerConnection) Close() error {
-	p.cancel()
-	return p.pc.Close()
+func (tm *PeerSession) Close() error {
+	tm.cancel()
+	return tm.pc.Close()
 }
