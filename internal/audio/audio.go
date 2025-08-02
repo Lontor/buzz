@@ -11,7 +11,18 @@ const (
 	FormatF32
 )
 
-type HandlerFunc func(data []byte, frameCount int)
+type deviceStatus uint8
+
+const (
+	statusInactive deviceStatus = iota
+	statusActive
+	statusPaused
+)
+
+type SlicePool interface {
+	Get() []byte
+	Put([]byte)
+}
 
 func FormatSize(format FormatType) int {
 	if format < 4 {
