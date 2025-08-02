@@ -62,11 +62,6 @@ func SetSignaler(ctx context.Context, conn Conn, pc *webrtc.PeerConnection) *Sig
 func (s *Signaler) readLoop() {
 	defer func() {
 		s.Close()
-		close(s.iceCh)
-		close(s.sdpCh)
-		close(s.randCh)
-		close(s.handshakeCh)
-		close(s.requestCh)
 	}()
 
 	for {
